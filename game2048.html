@@ -427,6 +427,17 @@
             <button class="game-btn" onclick="hideWinner()" style="margin-top: 20px;">OK</button>
         </div>
 
+        <!-- Info modal (reuses confirm styles) -->
+        <div class="confirm-overlay" id="infoOverlay" style="display:none;">
+            <div class="confirm-modal" role="dialog" aria-modal="true" aria-labelledby="infoTitle">
+                <div class="confirm-title" id="infoTitle"></div>
+                <div class="confirm-body" id="infoBody"></div>
+                <div class="confirm-actions">
+                    <button class="confirm-btn cancel" id="infoOk">OK</button>
+                </div>
+            </div>
+        </div>
+
         <!-- Confirm end match modal -->
         <div class="confirm-overlay" id="confirmOverlay">
             <div class="confirm-modal" role="dialog" aria-modal="true" aria-labelledby="confirmTitle">
@@ -649,8 +660,9 @@
         function saveSettings() {
             const selected = document.querySelector('input[name="gridSize"]:checked');
             gameState.gridSize = parseInt(selected.value);
-            alert('Đã lưu cài đặt! Kích thước lưới: ' + gameState.gridSize + 'x' + gameState.gridSize);
-            showMenu();
+            showInfoModal('Cài đặt đã lưu', 'Kích thước lưới: ' + gameState.gridSize + 'x' + gameState.gridSize, () => {
+                showMenu();
+            });
         }
 
         // Game initialization
@@ -1141,7 +1153,7 @@
         function undoMove() {
             if (gameState.isAnimating) return;
             if (gameState.gameHistory.length === 0) {
-                alert('Không thể undo thêm!');
+                showInfoModal('Không thể undo', 'Không thể undo thêm!');
                 return;
             }
             
@@ -1417,6 +1429,77 @@
             return a;
         }
 
+        // AI-specific expectimax evaluator (operates on AI grid) with a small cache and stronger sampling for hard difficulty
+                const expectimaxAICache = new Map();
+
+                function gridToKey(grid) {
+                    return grid.map(r => r.join(',')).join(';');
+                }
+
+                function evaluateMoveExpectimaxAI(direction) {
+                    const baseGrid = aiTilesToGrid();
+
+                    const cacheKey = gridToKey(baseGrid) + '|' + direction + '|' + gameState.aiDifficulty;
+                    if (expectimaxAICache.has(cacheKey)) return expectimaxAICache.get(cacheKey);
+
+                    const first = applyMoveToGrid(baseGrid, direction);
+                    if (!first.moved) return Number.NEGATIVE_INFINITY;
+
+                    const afterGrid = first.grid;
+                    const immediateScore = evaluateGridHeuristic(afterGrid, first.scoreGain);
+
+                    // get empty cells
+                    const empties = [];
+                    for (let i = 0; i < gameState.gridSize; i++) {
+                        for (let j = 0; j < gameState.gridSize; j++) {
+                            if (afterGrid[i][j] === 0) empties.push({i, j});
+                        }
+                    }
+
+                    if (empties.length === 0) {
+                        expectimaxAICache.set(cacheKey, immediateScore);
+                        return immediateScore;
+                    }
+
+                    // sample size depends on difficulty: hard samples more positions for deeper look
+                    let sampleCap = 8;
+                    if (gameState.aiDifficulty === 'hard') sampleCap = 12;
+                    const sample = empties.length > sampleCap ? shuffleArray(empties).slice(0, sampleCap) : empties;
+
+                    let expected = 0;
+                    for (const cell of sample) {
+                        const candidates = [{v:2,p:0.9},{v:4,p:0.1}];
+                        let cellExpected = 0;
+                        for (const cand of candidates) {
+                            const g = afterGrid.map(row => row.slice());
+                            g[cell.i][cell.j] = cand.v;
+
+                            let bestNext = Number.NEGATIVE_INFINITY;
+                            const dirs = ['up','down','left','right'];
+                            for (const d of dirs) {
+                                const res = applyMoveToGrid(g, d);
+                                if (!res.moved) continue;
+                                const val = evaluateGridHeuristic(res.grid, res.scoreGain);
+                                if (val > bestNext) bestNext = val;
+                            }
+                            if (bestNext === Number.NEGATIVE_INFINITY) bestNext = evaluateGridHeuristic(g, 0);
+
+                            cellExpected += cand.p * bestNext;
+                        }
+                        expected += cellExpected;
+                    }
+
+                    expected = expected / sample.length;
+                    const result = immediateScore * 0.6 + expected * 0.4;
+                    // cache moderately
+                    expectimaxAICache.set(cacheKey, result);
+                    if (expectimaxAICache.size > 2000) {
+                        const it = expectimaxAICache.keys();
+                        expectimaxAICache.delete(it.next().value);
+                    }
+                    return result;
+                }
+
         function checkGameOver() {
             const grid = tilesToGrid();
             
@@ -1436,21 +1519,21 @@
                 }
             }
             
-            alert('Game Over!\nĐiểm cuối cùng: ' + gameState.score);
+            showInfoModal('Game Over', 'Điểm cuối cùng: ' + gameState.score);
             return true;
         }
 
         function restartGame() {
-            if (confirm('Bạn có chắc muốn chơi lại?')) {
+            showConfirmModal('Bạn có chắc muốn chơi lại?', () => {
                 initGame();
-            }
+            });
         }
 
         function startAIPlayer() {
             const aiSpeed = {
-                easy: 2000,
-                medium: 1500,
-                hard: 1000
+                easy: 1300,
+                medium: 1000,
+                hard: 700
             };
             
             gameState.aiTimer = setInterval(() => {
@@ -1461,10 +1544,21 @@
         function makeAIMoveAnimated() {
             const directions = ['up', 'down', 'left', 'right'];
             let bestMove = null;
-            let bestScore = -1;
-            
+            let bestScore = Number.NEGATIVE_INFINITY;
+
             for (const direction of directions) {
-                const score = evaluateMoveAI(direction);
+                let score;
+                if (gameState.aiDifficulty === 'hard') {
+                    // stronger expectimax-like evaluator for hard mode using AI grid
+                    score = evaluateMoveExpectimaxAI(direction);
+                } else {
+                    // medium and easy still use evaluateMoveAI (which contains some randomness)
+                    score = evaluateMoveAI(direction);
+                }
+
+                // small tie-breaker randomness to avoid deterministic loops
+                if (score !== Number.NEGATIVE_INFINITY) score += Math.random() * 0.0001;
+
                 if (score > bestScore) {
                     bestScore = score;
                     bestMove = direction;
@@ -1621,14 +1715,19 @@
 
             const grid = aiTilesToGrid();
             const emptyCells = countEmptyCells(grid);
-            score += emptyCells * 10;
+            if (gameState.aiDifficulty === 'hard') {
+                score += emptyCells * 200;
+                score += calculateMonotonicity(grid) * 25;
+                score += calculateSmoothness(grid) * 10;
+            } else {
+                score += emptyCells * 10;
+                score += calculateMonotonicity(grid) * 5;
 
-            score += calculateMonotonicity(grid) * 5;
-
-            if (gameState.aiDifficulty === 'easy') {
-                score += Math.random() * 100;
-            } else if (gameState.aiDifficulty === 'medium') {
-                score += Math.random() * 50;
+                if (gameState.aiDifficulty === 'easy') {
+                    score += Math.random() * 100;
+                } else if (gameState.aiDifficulty === 'medium') {
+                    score += Math.random() * 50;
+                }
             }
             
             // Restore AI tiles and re-render to avoid disappearing numbers after simulation
@@ -1814,6 +1913,58 @@
         function hideWinner() {
             document.getElementById('winnerAnnouncement').style.display = 'none';
             showPlayOptions();
+        }
+
+        // Modal helpers
+        function showInfoModal(title, message, onClose) {
+            const overlay = document.getElementById('infoOverlay');
+            const titleEl = document.getElementById('infoTitle');
+            const bodyEl = document.getElementById('infoBody');
+            const okBtn = document.getElementById('infoOk');
+
+            titleEl.textContent = title || '';
+            bodyEl.textContent = message || '';
+            overlay.style.display = 'flex';
+
+            function cleanup() {
+                okBtn.removeEventListener('click', onOk);
+            }
+
+            function onOk() {
+                overlay.style.display = 'none';
+                cleanup();
+                if (typeof onClose === 'function') onClose();
+            }
+
+            okBtn.addEventListener('click', onOk);
+        }
+
+        function showConfirmModal(message, onConfirm, onCancel) {
+            const overlay = document.getElementById('confirmOverlay');
+            overlay.style.display = 'flex';
+
+            const cancelBtn = document.getElementById('confirmCancel');
+            const endBtn = document.getElementById('confirmEnd');
+
+            function cleanupHandlers() {
+                cancelBtn.removeEventListener('click', onCancelInternal);
+                endBtn.removeEventListener('click', onConfirmInternal);
+            }
+
+            function onCancelInternal() {
+                overlay.style.display = 'none';
+                cleanupHandlers();
+                if (typeof onCancel === 'function') onCancel();
+            }
+
+            function onConfirmInternal() {
+                overlay.style.display = 'none';
+                cleanupHandlers();
+                if (typeof onConfirm === 'function') onConfirm();
+            }
+
+            cancelBtn.addEventListener('click', onCancelInternal);
+            endBtn.addEventListener('click', onConfirmInternal);
         }
 
         let touchStartX = 0;
